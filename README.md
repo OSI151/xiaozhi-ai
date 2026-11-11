@@ -6,6 +6,14 @@
 
 一块 1.3 寸 SH1106 单色 OLED 装在车头，上面画两只眼睛。眼睛会跟着说话的语气变——问句变成歪头思考、感叹句变成眯眼笑、说到好笑的地方会真的笑起来。距离近了屏幕会动，撞墙之前会先停。
 
+> **许可证说明**
+>
+> 本项目基于 [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32)（MIT，Copyright © 2025 Shenzhen Xinzhi Future Technology Co., Ltd.）修改。
+>
+> 但 `main/third_party/roboeyes/` 里的 [RoboEyes](https://github.com/FluxGarage/RoboEyes) 是 **GPL-3.0-or-later**（Copyright © 2024-2025 Dennis Hoelscher），它被静态链接进同一个固件二进制。按 GPL 的传染性要求，**整个项目以 GPL-3.0 发布**，而不是 MIT。
+>
+> MIT 代码并入 GPL 工程是允许的（单向兼容），反之不行。所以 `LICENSE` 是 GPL-3.0 全文，不是笔误。详见 [NOTICE](NOTICE)。
+
 ## 硬件清单
 
 | 部件 | 型号 | 数量 | 说明 |
@@ -25,6 +33,11 @@
 > 主控和电机**分开供电**是关键。N20 启动瞬间能到 1A 以上，和 ESP32 共用一路会把电压拉低导致复位。
 
 ## 接线表
+
+![接线图](docs/hardware-wiring.png)
+
+上图是完整接线示意，下面按外设分组列出引脚对应关系。
+
 
 ### 显示屏（I2C0）
 
