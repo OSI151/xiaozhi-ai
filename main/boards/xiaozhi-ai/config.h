@@ -1,0 +1,65 @@
+#ifndef _BOARD_CONFIG_H_
+#define _BOARD_CONFIG_H_
+
+#include <driver/gpio.h>
+
+#define AUDIO_INPUT_SAMPLE_RATE  16000
+#define AUDIO_OUTPUT_SAMPLE_RATE 24000
+
+// INMP441 数字麦克风 + MAX98357A 功放，收发各走一路 I2S
+#define AUDIO_I2S_METHOD_SIMPLEX
+
+#define AUDIO_I2S_MIC_GPIO_WS   GPIO_NUM_4
+#define AUDIO_I2S_MIC_GPIO_SCK  GPIO_NUM_5
+#define AUDIO_I2S_MIC_GPIO_DIN  GPIO_NUM_6
+
+#define AUDIO_I2S_SPK_GPIO_DOUT GPIO_NUM_7
+#define AUDIO_I2S_SPK_GPIO_BCLK GPIO_NUM_15
+#define AUDIO_I2S_SPK_GPIO_LRCK GPIO_NUM_16
+
+#define BUILTIN_LED_GPIO        GPIO_NUM_48
+#define BOOT_BUTTON_GPIO        GPIO_NUM_0
+#define TOUCH_BUTTON_GPIO       GPIO_NUM_47
+#define VOLUME_UP_BUTTON_GPIO   GPIO_NUM_40
+#define VOLUME_DOWN_BUTTON_GPIO GPIO_NUM_39
+
+#define DISPLAY_SDA_PIN GPIO_NUM_41
+#define DISPLAY_SCL_PIN GPIO_NUM_42
+#define DISPLAY_WIDTH   128
+
+#if CONFIG_OLED_SSD1306_128X32
+#define DISPLAY_HEIGHT  32
+#elif CONFIG_OLED_SSD1306_128X64
+#define DISPLAY_HEIGHT  64
+#elif CONFIG_OLED_SH1106_128X64
+#define DISPLAY_HEIGHT  64
+#define SH1106
+#else
+#error "OLED display type is not selected"
+#endif
+
+#define DISPLAY_MIRROR_X false
+#define DISPLAY_MIRROR_Y false
+
+// A MCP Test: Control a lamp（官方自带，本机未接这颗灯）
+#define LAMP_GPIO GPIO_NUM_18
+
+// ===== 以下引脚供后续移植模块使用，0a 阶段只定义不启用 =====
+
+// DRV8833 双 H 桥，驱动两个 N20 减速电机
+#define MOTOR_LF_GPIO GPIO_NUM_12
+#define MOTOR_LB_GPIO GPIO_NUM_13
+#define MOTOR_RF_GPIO GPIO_NUM_14
+#define MOTOR_RB_GPIO GPIO_NUM_21
+
+// WS2812 灯带
+#define WS2812_GPIO       GPIO_NUM_38
+#define WS2812_LED_COUNT  7
+
+// VL6180X 激光测距，独立 I2C1 总线
+// 实测接线：GPIO1 = SCL，GPIO2 = SDA（分线板丝印 GND VIN SCL SDA 的顺序）
+// 原来挂在屏幕总线上（41/42），已拆焊挪到这两个脚。
+#define SENSOR_I2C_SCL_PIN GPIO_NUM_1
+#define SENSOR_I2C_SDA_PIN GPIO_NUM_2
+
+#endif // _BOARD_CONFIG_H_

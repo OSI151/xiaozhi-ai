@@ -1,0 +1,46 @@
+本项目的部分组件版权归第三方所有，按各自许可证条款使用：
+
+================================================================
+xiaozhi-esp32
+================================================================
+Copyright (c) 2025 Shenzhen Xinzhi Future Technology Co., Ltd.
+License: MIT
+https://github.com/78/xiaozhi-esp32
+
+本项目基于该框架开发，对其 main/ 目录有大量修改与新增。
+
+================================================================
+FluxGarage RoboEyes
+================================================================
+Copyright (C) 2024-2025 Dennis Hoelscher
+License: GNU General Public License v3.0 or later
+https://github.com/FluxGarage/RoboEyes
+
+位于 main/third_party/roboeyes/。该组件为 GPL-3.0-or-later，
+与本项目其余代码静态链接，因此本项目整体以 GPL-3.0 发布。
+
+================================================================
+esp_lvgl_port
+================================================================
+Copyright (c) Espressif Systems (Shanghai) CO LTD
+License: Apache-2.0
+https://github.com/espressif/esp-bsp
+
+位于 components/esp_lvgl_port/，是从上游复制出来改过的副本
+（修了单色屏脏区刷新的页偏移问题）。
+
+================================================================
+sh1106-esp-idf
+================================================================
+Copyright (c) TNY Robotics
+License: MIT
+https://github.com/tny-robotics/sh1106-esp-idf
+
+通过 idf_component.yml 引入，未修改。
+
+================================================================
+ESP-IDF
+================================================================
+Copyright (c) Espressif Systems (Shanghai) CO LTD
+License: Apache-2.0
+https://github.com/espressif/esp-idf

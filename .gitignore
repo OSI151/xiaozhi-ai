@@ -1,0 +1,20 @@
+# 构建产物
+build/
+managed_components/
+*.bin
+*.elf
+*.map
+
+# 本地配置（含 WiFi 凭据等，不要提交）
+sdkconfig
+sdkconfig.old
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 备份
+*.bak
+*.bak-*
