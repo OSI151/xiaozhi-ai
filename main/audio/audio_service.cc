@@ -1,6 +1,39 @@
 #include "audio_service.h"
+#include "playback_level.h"
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <cstring>
+#include <atomic>
+#include <cmath>
+
+namespace {
+std::atomic<uint8_t> g_playback_level{0};
+std::atomic<int64_t> g_playback_level_ms{0};
+
+// 人声 RMS 大致落在 300~6000（int16 满量程 32768），超过 6000 就当满格。
+// 阈值定得低是故意的：小音量说话也得能让灯动起来，宁可早一点到顶。
+constexpr uint32_t kRmsFullScale = 6000;
+
+// 多久没新值就当作静音。TTS 说完最后一句后播放循环不再跑，
+// 没有谁会来把值改回 0，不做过期判断灯就会一直亮着。
+constexpr int64_t kLevelStaleMs = 120;
+}  // namespace
+
+void SetPlaybackLevel(uint8_t level) {
+    g_playback_level.store(level, std::memory_order_relaxed);
+    g_playback_level_ms.store(esp_timer_get_time() / 1000, std::memory_order_relaxed);
+}
+
+uint8_t GetPlaybackLevel() {
+    const int64_t last = g_playback_level_ms.load(std::memory_order_relaxed);
+    if (last == 0) {
+        return 0;
+    }
+    if (esp_timer_get_time() / 1000 - last > kLevelStaleMs) {
+        return 0;
+    }
+    return g_playback_level.load(std::memory_order_relaxed);
+}
 
 #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
     (esp_ae_rate_cvt_cfg_t)                                  \
@@ -304,6 +337,26 @@ void AudioService::AudioOutputTask() {
             esp_timer_stop(audio_power_timer_);
             esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
             codec_->EnableOutput(true);
+        }
+
+        // 交给功放之前先量一下这一帧有多响，给灯效用。
+        // 放在这里而不是解码处：这里已经是最终要播的 PCM（重采样、音量都做完了），
+        // 数值和耳朵听到的一致。
+        {
+            const size_t n = task->pcm.size();
+            if (n > 0) {
+                const int16_t* pcm = task->pcm.data();
+                int64_t acc = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    const int32_t s = pcm[i];
+                    acc += (int64_t)s * s;
+                }
+                const uint32_t rms = (uint32_t)sqrtf((float)acc / (float)n);
+                const uint32_t lvl = rms >= kRmsFullScale ? 255u : rms * 255u / kRmsFullScale;
+                SetPlaybackLevel((uint8_t)lvl);
+            } else {
+                SetPlaybackLevel(0);
+            }
         }
 
         codec_->OutputData(task->pcm);

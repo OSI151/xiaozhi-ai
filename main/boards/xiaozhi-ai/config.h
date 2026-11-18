@@ -54,12 +54,30 @@
 
 // WS2812 灯带
 #define WS2812_GPIO       GPIO_NUM_38
+// 默认用几颗。这个值只在 NVS 里没存过数量时生效，日常改颗数走 Web 页面。
 #define WS2812_LED_COUNT  7
+// 灯带物理长度：实际焊在线上的颗数。
+// 效果只驱动前 WS2812_LED_COUNT 颗，剩下的每帧都会被显式写黑——
+// 不写的话它们收不到新数据，会一直保持上一次锁存的颜色（开机噪声常常是白的）。
+// 只有换灯带才需要改这里并重新编译。
+#define WS2812_STRIP_LENGTH 160
 
 // VL6180X 激光测距，独立 I2C1 总线
 // 实测接线：GPIO1 = SCL，GPIO2 = SDA（分线板丝印 GND VIN SCL SDA 的顺序）
 // 原来挂在屏幕总线上（41/42），已拆焊挪到这两个脚。
 #define SENSOR_I2C_SCL_PIN GPIO_NUM_1
 #define SENSOR_I2C_SDA_PIN GPIO_NUM_2
+
+// ===== 红外避障（反射式开关量，三线 VCC / GND / OUT）=====
+// 装在车尾，朝后。用途是配合激光测距守倒车这一侧：任何后退动作时后面有
+// 东西就立刻停。停之后的动作由各模式自己的代码决定，驱动层不管。
+// GPIO8 在 ESP32-S3 上不是 strapping 脚（strapping 是 0/3/45/46），
+// 也不与已用的音频 4-7/15/16、按键 0/39/40/47/48、屏幕 41/42、
+// 电机 12/13/14/21、灯带 38、传感器 1/2 冲突。
+#define INFRARED_AVOID_GPIO       GPIO_NUM_8
+
+// 有障碍时输出低电平（带 LM393 比较器的模块基本如此）。
+// 实测极性相反就改成 0，驱动不用动。
+#define INFRARED_AVOID_ACTIVE_LOW 1
 
 #endif // _BOARD_CONFIG_H_

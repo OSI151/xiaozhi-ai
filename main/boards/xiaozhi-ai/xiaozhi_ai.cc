@@ -9,6 +9,7 @@
 #include "lamp_controller.h"
 #include "led/single_led.h"
 #include "rgb_strip.h"
+#include "infrared_avoid.h"
 #include "peripherals/vl6180x.h"
 #include "i2c_panel_io_timeout.h"
 #include "assets/lang_config.h"
@@ -19,12 +20,18 @@
 #include <esp_lcd_panel_vendor.h>
 #include <wifi_manager.h>
 #include <cJSON.h>
+#include <cstring>
+#include <cstdio>
 
 #ifdef SH1106
 #include <esp_lcd_panel_sh1106.h>
 #endif
 
 #define TAG "XiaozhiAiBoard"
+
+// 给 web_server 用的句柄。web_server 不 include 板卡头文件，
+// 只通过下面这组 extern "C" 函数访问灯带。
+static RgbStrip* g_rgb_strip_for_web = nullptr;
 
 // 第 1 步：电机动作统一走 Application 的 PWM 中枢（DRV8833 双 H 桥，GPIO 12/13/14/21）
 // direction: 4=前进 2=后退 3=左转 1=右转 0=停
@@ -50,14 +57,48 @@ private:
     // WS2812 灯带（GPIO38，5 颗）。和板载那颗（GPIO48，SingleLed）是两套独立实例，
     // 各占一个 RMT 通道，互不影响。
     std::unique_ptr<RgbStrip> rgb_strip_;
+    std::unique_ptr<InfraredAvoidSensor> infrared_avoid_;
 
     void InitializeRgbStrip() {
-        rgb_strip_ = std::make_unique<RgbStrip>(WS2812_GPIO, WS2812_LED_COUNT);
+        // 灯珠数量可以从 Web 改并存 NVS，所以上电时以存下来的为准，
+        // 没存过才用 config.h 里的编译期默认值。
+        // 第三个参数是物理长度：RMT 按它发数据，多出来的每帧写黑。
+        const uint16_t count = RgbStrip::LoadLedCount(WS2812_LED_COUNT);
+        rgb_strip_ = std::make_unique<RgbStrip>(WS2812_GPIO, count, WS2812_STRIP_LENGTH);
+        g_rgb_strip_for_web = rgb_strip_.get();
+        ESP_LOGI(TAG, "LED count %u / strip length %u (default %d)",
+                 (unsigned)count, (unsigned)rgb_strip_->StripLength(), (int)WS2812_LED_COUNT);
         rgb_strip_->LoadFromNvs();
         // 上电先亮"启动中"的效果，等设备进 idle 再切到空闲效果
         // 开机不主动亮灯：之前调的是 kSlotStartupInitial（青色常亮），
         // 用户关灯后一重启又亮起来，像是没关掉。改走 idle 槽位（灭灯）。
         rgb_strip_->ApplySlot(RgbStrip::kSlotStartupIdle);
+
+        // 状态 → 灯带槽位。listening/speaking 两个槽位早就定义了却一直没人用，
+        // 因为板卡收不到状态变化（Board 基类只有 Led 才有 OnStateChanged）。
+        // 这里让 Application 把状态转出来，说话时走语音律动，聆听时灭灯。
+        // 只处理这两个状态：idle 不碰，好让手动设的灯色留得住。
+        Application::GetInstance().SetLedStateListener([](int state) {
+            auto* strip = g_rgb_strip_for_web;
+            if (strip == nullptr) {
+                return;
+            }
+            // 用户手动设过效果就不要再抢他的：说话/聆听都不覆盖，
+            // 直到他在页面上点"恢复随状态联动"（那会清掉这个标志）。
+            if (strip->ManualOverride()) {
+                return;
+            }
+            switch (static_cast<DeviceState>(state)) {
+                case kDeviceStateSpeaking:
+                    strip->ApplySlot(RgbStrip::kSlotSpeaking);
+                    break;
+                case kDeviceStateListening:
+                    strip->ApplySlot(RgbStrip::kSlotListening);
+                    break;
+                default:
+                    break;
+            }
+        });
     }
 
     void InitializeDisplayI2c() {
@@ -111,6 +152,26 @@ private:
         sensor_->Start();
         // 交给 Application，Web 和模式逻辑都从它那儿取快照。
         Application::GetInstance().AttachSensor(sensor_.get());
+    }
+
+    // 红外对射避障：只给「挡了 / 没挡」这一个信号，不给距离。
+    // 和 VL6180X 不冲突——那个管桌沿和精确距离，这个管太快、太黑、
+    // 太近（近到激光测距反而读不出来）的场合。
+    void InitializeInfraredAvoid() {
+        infrared_avoid_ = std::make_unique<InfraredAvoidSensor>();
+        if (!infrared_avoid_->Begin(INFRARED_AVOID_GPIO, INFRARED_AVOID_ACTIVE_LOW != 0)) {
+            ESP_LOGW(TAG, "infrared avoid init failed on GPIO%d, backward guard disabled",
+                     static_cast<int>(INFRARED_AVOID_GPIO));
+            infrared_avoid_.reset();
+            return;
+        }
+        // 包成 lambda 交给 Application：那边不 include 板卡头文件，
+        // 电机闸门和看门任务都只认 std::function<bool()>。
+        Application::GetInstance().AttachObstacleProbe(
+            [this]() { return infrared_avoid_->IsBlocked(); });
+        ESP_LOGI(TAG, "infrared avoid ready: GPIO%d, active %s",
+                 static_cast<int>(INFRARED_AVOID_GPIO),
+                 INFRARED_AVOID_ACTIVE_LOW ? "low" : "high");
     }
 
     // SSD1306 与 SH1106 共用这套 IO 配置，只有 panel 构造函数不同
@@ -673,6 +734,31 @@ private:
 
         // ---- 2 个机器人模式工具 ----
 
+        // ---- 1 个红外避障工具 ----
+
+        mcp_server.AddTool("self.avoid.status",
+            "读取红外对射避障的当前状态。这是开关量：只回答「后方挡了 / 没挡」，不提供距离。\\n"
+            "返回原始电平、开机以来触发次数，以及此刻后退指令会不会被拦截。\\n"
+            "传感器装在后头，管的是倒车这一侧；要前方距离用 self.sensor.get_distance。",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                if (!infrared_avoid_) {
+                    return std::string("红外避障没有装，或者启动失败。");
+                }
+                std::string out = infrared_avoid_->IsBlocked() ? "后方有遮挡。" : "后方通畅。";
+                out += "原始电平 ";
+                out += infrared_avoid_->RawLevel() ? "高" : "低";
+                out += "，开机以来触发 ";
+                out += std::to_string(infrared_avoid_->TriggerCount());
+                out += " 次。";
+                if (infrared_avoid_->IsBlocked()) {
+                    out += "此刻后退会被拦截，前进和转向不受影响。";
+                }
+                return out;
+            });
+
+        ESP_LOGI(TAG, "红外避障工具注册完成：1 个（avoid.status）");
+
         mcp_server.AddTool("self.robot.start",
             "让机器人进入自动模式，开始自己动起来。mode 只能是这四个之一："
             "explore（到处乱走探索，不需要传感器）、"
@@ -734,6 +820,7 @@ public:
         InitializeOledDisplay();
         InitializeSensorI2c();
         InitializeSensor();
+        InitializeInfraredAvoid();
         InitializeButtons();
         InitializeRgbStrip();
         InitializeTools();
@@ -762,3 +849,325 @@ public:
 };
 
 DECLARE_BOARD(XiaozhiAiBoard);
+
+// ===== 灯光 Web 接口 =====
+// web_server.cc 是公共文件，不 include 板卡头文件；所以这里只导出 C 接口，
+// JSON 的拼装和解析都放在板卡侧（只有它知道 StripParams 长什么样）。
+// 约定：调用方传一块缓冲进来，返回值表示填充成功，避免跨模块传堆指针。
+
+namespace {
+
+bool JsonToBuf(cJSON* root, char* out, size_t out_len) {
+    if (root == nullptr) return false;
+    char* s = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (s == nullptr) return false;
+    size_t n = strlen(s);
+    bool ok = (n + 1) <= out_len;
+    if (ok) memcpy(out, s, n + 1);
+    cJSON_free(s);
+    return ok;
+}
+
+void SetErr(char* err, size_t errlen, const char* msg) {
+    if (err != nullptr && errlen > 0) {
+        snprintf(err, errlen, "%s", msg);
+    }
+}
+
+// 从 JSON 对象里读参数。字段都可以缺省，缺省就保持 out 里的原值，
+// 这样 Web 端只发改动过的那几个也能生效。
+bool ParseParamsObject(const cJSON* obj, StripParams* out, char* err, size_t errlen) {
+    if (obj == nullptr) return true;
+    if (!cJSON_IsObject(obj)) {
+        SetErr(err, errlen, "params must be an object");
+        return false;
+    }
+
+    const cJSON* effect = cJSON_GetObjectItemCaseSensitive(obj, "effect");
+    if (effect != nullptr) {
+        uint8_t id = kFxCount;
+        if (cJSON_IsNumber(effect)) {
+            int v = effect->valueint;
+            if (v >= 0 && v < (int)kFxCount) id = (uint8_t)v;
+        } else if (cJSON_IsString(effect)) {
+            id = FindEffectByName(effect->valuestring);
+            if (id == kFxCount && effect->valuestring[0] != 0 && effect->valuestring[1] == 0) {
+                id = FindEffectByLetter(effect->valuestring[0]);
+            }
+        }
+        if (id >= kFxCount) {
+            SetErr(err, errlen, "unknown effect");
+            return false;
+        }
+        out->effect = id;
+    }
+
+    const struct {
+        const char* key;
+        uint8_t* dst;
+        int lo;
+        int hi;
+    } num_fields[] = {
+        {"speed", &out->speed, 0, 255},
+        {"intensity", &out->intensity, 0, 255},
+        {"c1", &out->c1, 0, 255},
+        {"c2", &out->c2, 0, 255},
+    };
+    for (const auto& f : num_fields) {
+        const cJSON* v = cJSON_GetObjectItemCaseSensitive(obj, f.key);
+        if (v == nullptr) continue;
+        if (!cJSON_IsNumber(v)) {
+            SetErr(err, errlen, "numeric field expected");
+            return false;
+        }
+        int n = v->valueint;
+        if (n < f.lo) n = f.lo;
+        if (n > f.hi) n = f.hi;
+        *f.dst = (uint8_t)n;
+    }
+
+    const cJSON* colors = cJSON_GetObjectItemCaseSensitive(obj, "colors");
+    if (colors != nullptr) {
+        if (!cJSON_IsArray(colors)) {
+            SetErr(err, errlen, "colors must be an array");
+            return false;
+        }
+        int n = cJSON_GetArraySize(colors);
+        if (n > 6) n = 6;
+        out->color_count = 0;
+        for (int i = 0; i < n; i++) {
+            const cJSON* t = cJSON_GetArrayItem(colors, i);
+            if (!cJSON_IsArray(t) || cJSON_GetArraySize(t) < 3) {
+                SetErr(err, errlen, "each color must be [r,g,b]");
+                return false;
+            }
+            const cJSON* r = cJSON_GetArrayItem(t, 0);
+            const cJSON* g = cJSON_GetArrayItem(t, 1);
+            const cJSON* b = cJSON_GetArrayItem(t, 2);
+            if (!cJSON_IsNumber(r) || !cJSON_IsNumber(g) || !cJSON_IsNumber(b)) {
+                SetErr(err, errlen, "color components must be numbers");
+                return false;
+            }
+            StripColor c;
+            c.r = (uint8_t)(r->valueint < 0 ? 0 : (r->valueint > 255 ? 255 : r->valueint));
+            c.g = (uint8_t)(g->valueint < 0 ? 0 : (g->valueint > 255 ? 255 : g->valueint));
+            c.b = (uint8_t)(b->valueint < 0 ? 0 : (b->valueint > 255 ? 255 : b->valueint));
+            out->colors[out->color_count++] = c;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+extern "C" {
+
+bool HandleLedEffectsJson(char* out, size_t out_len) {
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) return false;
+    cJSON* arr = cJSON_AddArrayToObject(root, "effects");
+    for (int i = 0; i < (int)kFxCount; i++) {
+        const EffectDef& d = kEffects[i];
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "id", i);
+        cJSON_AddStringToObject(item, "name", d.name);
+        char letter[2] = {d.letter, 0};
+        cJSON_AddStringToObject(item, "letter", d.letter ? letter : "");
+        cJSON_AddNumberToObject(item, "mask", d.param_mask);
+        cJSON_AddStringToObject(item, "p1", d.p1 ? d.p1 : "");
+        cJSON_AddStringToObject(item, "p2", d.p2 ? d.p2 : "");
+        cJSON_AddStringToObject(item, "p3", d.p3 ? d.p3 : "");
+        cJSON_AddStringToObject(item, "p4", d.p4 ? d.p4 : "");
+        cJSON_AddNumberToObject(item, "cmin", d.color_min);
+        cJSON_AddNumberToObject(item, "cmax", d.color_max);
+        cJSON_AddItemToArray(arr, item);
+    }
+    cJSON_AddNumberToObject(root, "brightness", RgbStrip::GetBrightness());
+    return JsonToBuf(root, out, out_len);
+}
+
+bool HandleLedStatusJson(char* out, size_t out_len) {
+    if (g_rgb_strip_for_web == nullptr) return false;
+    StripParams p = g_rgb_strip_for_web->GetParams();
+
+    cJSON* root = cJSON_CreateObject();
+    if (root == nullptr) return false;
+    cJSON_AddNumberToObject(root, "brightness", RgbStrip::GetBrightness());
+    cJSON_AddNumberToObject(root, "led_count", (int)g_rgb_strip_for_web->LedCount());
+    cJSON_AddNumberToObject(root, "led_max", (int)RgbStrip::kMaxLeds);
+    cJSON_AddNumberToObject(root, "strip_length", (int)g_rgb_strip_for_web->StripLength());
+    cJSON_AddBoolToObject(root, "manual_override", g_rgb_strip_for_web->ManualOverride());
+    cJSON_AddStringToObject(root, "gcode", g_rgb_strip_for_web->GetCurrentGcode().c_str());
+
+    cJSON* params = cJSON_AddObjectToObject(root, "params");
+    cJSON_AddNumberToObject(params, "effect", p.effect);
+    cJSON_AddNumberToObject(params, "speed", p.speed);
+    cJSON_AddNumberToObject(params, "intensity", p.intensity);
+    cJSON_AddNumberToObject(params, "c1", p.c1);
+    cJSON_AddNumberToObject(params, "c2", p.c2);
+    cJSON* colors = cJSON_AddArrayToObject(params, "colors");
+    for (int i = 0; i < p.color_count && i < 6; i++) {
+        cJSON* c = cJSON_CreateArray();
+        cJSON_AddItemToArray(c, cJSON_CreateNumber(p.colors[i].r));
+        cJSON_AddItemToArray(c, cJSON_CreateNumber(p.colors[i].g));
+        cJSON_AddItemToArray(c, cJSON_CreateNumber(p.colors[i].b));
+        cJSON_AddItemToArray(colors, c);
+    }
+
+    cJSON* slots = cJSON_AddArrayToObject(root, "slots");
+    for (int i = 0; i < (int)RgbStrip::kSlotCount; i++) {
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddNumberToObject(item, "id", i);
+        cJSON_AddStringToObject(item, "key", RgbStrip::SlotName((RgbStrip::Slot)i));
+        cJSON_AddStringToObject(item, "gcode",
+                                g_rgb_strip_for_web->GetSlotGcode((RgbStrip::Slot)i).c_str());
+        cJSON_AddItemToArray(slots, item);
+    }
+    return JsonToBuf(root, out, out_len);
+}
+
+// 立即生效，不写 NVS。body 形如 {"effect":5,"speed":128,...}
+bool HandleLedApplyJson(const char* json, char* err, size_t errlen) {
+    if (g_rgb_strip_for_web == nullptr) {
+        SetErr(err, errlen, "led strip not ready");
+        return false;
+    }
+    if (json == nullptr || json[0] == 0) {
+        SetErr(err, errlen, "empty body");
+        return false;
+    }
+    cJSON* root = cJSON_Parse(json);
+    if (root == nullptr) {
+        SetErr(err, errlen, "invalid json");
+        return false;
+    }
+    StripParams p = g_rgb_strip_for_web->GetParams();
+    bool ok = ParseParamsObject(root, &p, err, errlen);
+    // 允许顺带改亮度
+    const cJSON* br = cJSON_GetObjectItemCaseSensitive(root, "brightness");
+    int brightness = -1;
+    if (ok && cJSON_IsNumber(br)) brightness = br->valueint;
+    cJSON_Delete(root);
+    if (!ok) return false;
+
+    g_rgb_strip_for_web->ApplyParams(p);
+    if (brightness >= 0) g_rgb_strip_for_web->SetBrightness(brightness);
+    return true;
+}
+
+// 直接吃 gcode，给"从旧值恢复/手工输入"用。
+bool HandleLedApplyGcode(const char* gcode, char* err, size_t errlen) {
+    if (g_rgb_strip_for_web == nullptr) {
+        SetErr(err, errlen, "led strip not ready");
+        return false;
+    }
+    std::string error;
+    if (!g_rgb_strip_for_web->ApplyGcode(gcode ? gcode : "", &error)) {
+        SetErr(err, errlen, error.empty() ? "invalid gcode" : error.c_str());
+        return false;
+    }
+    return true;
+}
+
+// body 形如 {"slot":"listening","params":{...}} 或 {"slot":3,"gcode":"7,90,W"}
+bool HandleLedSaveSlotJson(const char* json, char* err, size_t errlen) {
+    if (g_rgb_strip_for_web == nullptr) {
+        SetErr(err, errlen, "led strip not ready");
+        return false;
+    }
+    cJSON* root = cJSON_Parse(json ? json : "");
+    if (root == nullptr) {
+        SetErr(err, errlen, "invalid json");
+        return false;
+    }
+
+    RgbStrip::Slot slot = RgbStrip::kSlotCount;
+    const cJSON* s = cJSON_GetObjectItemCaseSensitive(root, "slot");
+    if (cJSON_IsNumber(s)) {
+        int v = s->valueint;
+        if (v >= 0 && v < (int)RgbStrip::kSlotCount) slot = (RgbStrip::Slot)v;
+    } else if (cJSON_IsString(s)) {
+        for (int i = 0; i < (int)RgbStrip::kSlotCount; i++) {
+            if (strcmp(s->valuestring, RgbStrip::SlotName((RgbStrip::Slot)i)) == 0) {
+                slot = (RgbStrip::Slot)i;
+                break;
+            }
+        }
+    }
+    if (slot >= RgbStrip::kSlotCount) {
+        cJSON_Delete(root);
+        SetErr(err, errlen, "unknown slot");
+        return false;
+    }
+
+    const cJSON* gcode = cJSON_GetObjectItemCaseSensitive(root, "gcode");
+    if (cJSON_IsString(gcode)) {
+        std::string error;
+        if (!RgbStrip::ValidateGcode(gcode->valuestring, &error)) {
+            cJSON_Delete(root);
+            SetErr(err, errlen, error.empty() ? "invalid gcode" : error.c_str());
+            return false;
+        }
+        g_rgb_strip_for_web->SetSlotGcode(slot, gcode->valuestring);
+        cJSON_Delete(root);
+        return true;
+    }
+
+    // 变体：{"slot":"listening","params":{...}}，从当前参数改
+    StripParams p = g_rgb_strip_for_web->GetParams();
+    bool ok = ParseParamsObject(cJSON_GetObjectItemCaseSensitive(root, "params"), &p, err, errlen);
+    cJSON_Delete(root);
+    if (!ok) return false;
+
+    g_rgb_strip_for_web->SetSlotParams(slot, p);
+    return true;
+}
+
+int HandleLedSetBrightness(int percent) {
+    if (g_rgb_strip_for_web == nullptr) return -1;
+    g_rgb_strip_for_web->SetBrightness(percent);
+    RgbStrip::PersistBrightness();
+    return RgbStrip::GetBrightness();
+}
+
+int HandleLedGetBrightness() {
+    return RgbStrip::GetBrightness();
+}
+
+// 运行时改灯珠数量。返回改完之后的数量，-1 表示失败。
+// 上限 RgbStrip::kMaxLeds，超出的在 SetLedCount 里夹住。
+int HandleLedSetCount(int count) {
+    if (g_rgb_strip_for_web == nullptr) return -1;
+    return (int)g_rgb_strip_for_web->SetLedCount((uint16_t)count);
+}
+
+int HandleLedGetCount() {
+    if (g_rgb_strip_for_web == nullptr) return -1;
+    return (int)g_rgb_strip_for_web->LedCount();
+}
+
+int HandleLedMaxCount() {
+    return (int)RgbStrip::kMaxLeds;
+}
+
+// 恢复"跟随设备状态"：清掉手动覆盖，按当前状态重新挑槽位。
+int HandleLedFollowState(int device_state) {
+    if (g_rgb_strip_for_web == nullptr) return -1;
+    g_rgb_strip_for_web->ClearManualOverride();
+    switch (static_cast<DeviceState>(device_state)) {
+        case kDeviceStateSpeaking:
+            g_rgb_strip_for_web->ApplySlot(RgbStrip::kSlotSpeaking);
+            break;
+        case kDeviceStateListening:
+            g_rgb_strip_for_web->ApplySlot(RgbStrip::kSlotListening);
+            break;
+        default:
+            g_rgb_strip_for_web->ApplySlot(RgbStrip::kSlotStartupIdle);
+            break;
+    }
+    return 0;
+}
+
+}  // extern "C"
+

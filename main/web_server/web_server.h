@@ -100,6 +100,17 @@ private:
     static esp_err_t sensor_post_handler(httpd_req_t *req);
     static esp_err_t system_get_handler(httpd_req_t *req);
     static esp_err_t api_system_action_handler(httpd_req_t *req);
+    // 灯光：效果表与多参数应用。板卡侧用 extern "C" 提供实现，
+    // 这里只做 JSON 的搬运，不 include 板卡头文件。
+    static esp_err_t led_get_handler(httpd_req_t *req);
+    static esp_err_t api_led_status_handler(httpd_req_t *req);
+    static esp_err_t api_led_effects_handler(httpd_req_t *req);
+    static esp_err_t api_led_apply_handler(httpd_req_t *req);
+    static esp_err_t api_led_gcode_handler(httpd_req_t *req);
+    static esp_err_t api_led_slot_handler(httpd_req_t *req);
+    static esp_err_t api_led_brightness_handler(httpd_req_t *req);
+    static esp_err_t api_led_count_handler(httpd_req_t *req);
+    static esp_err_t api_led_follow_handler(httpd_req_t *req);
 
     // CORS处理
     static esp_err_t cors_handler(httpd_req_t *req);
@@ -117,6 +128,7 @@ private:
     static const char* get_robot_html_page();
     static const char* get_sensor_html_page();
     static const char* get_system_html_page();
+    static const char* get_led_html_page();
 };
 
 #endif // WEB_SERVER_H

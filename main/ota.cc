@@ -395,11 +395,13 @@ std::vector<int> Ota::ParseVersion(const std::string& version) {
     std::vector<int> versionNumbers;
     std::stringstream ss(version);
     std::string segment;
-    
+
+    // 与官方实现保持一致。这里要求版本串是纯数字点分（x.y.z），
+    // 约束写在 CMakeLists.txt 的 PROJECT_VER 上方——改版本号前先看那段注释。
     while (std::getline(ss, segment, '.')) {
         versionNumbers.push_back(std::stoi(segment));
     }
-    
+
     return versionNumbers;
 }
 

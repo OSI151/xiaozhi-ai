@@ -29,6 +29,23 @@ extern "C" {
     const char* HandleDisplayModeQuery();
 }
 
+// 灯光接口由板卡实现（main/boards/xiaozhi-ai/xiaozhi_ai.cc）。
+// 用 weak 是为了别的板卡编这个文件时不会链接失败——那种情况下这几个符号是空的，
+// handler 会直接回 503。
+extern "C" {
+bool HandleLedStatusJson(char* out, size_t out_len) __attribute__((weak));
+bool HandleLedEffectsJson(char* out, size_t out_len) __attribute__((weak));
+bool HandleLedApplyJson(const char* json, char* err, size_t errlen) __attribute__((weak));
+bool HandleLedApplyGcode(const char* gcode, char* err, size_t errlen) __attribute__((weak));
+bool HandleLedSaveSlotJson(const char* json, char* err, size_t errlen) __attribute__((weak));
+int  HandleLedSetBrightness(int percent) __attribute__((weak));
+int  HandleLedGetBrightness(void) __attribute__((weak));
+int  HandleLedSetCount(int count) __attribute__((weak));
+int  HandleLedGetCount(void) __attribute__((weak));
+int  HandleLedMaxCount(void) __attribute__((weak));
+int  HandleLedFollowState(int device_state) __attribute__((weak));
+}
+
 extern "C" void HandleMotorActionForApplication(int direction, int speed, int duration_ms, int priority);
 extern "C" void HandleMotorActionForEmotion(const char* emotion);
 extern "C" void HandleMotorActionForDance(uint8_t speed_percent);
@@ -51,7 +68,7 @@ bool WebServer::Start(int port) {
     // v206 原版这里是 10。我们陆续加了 /api/config、/api/sensor、
     // /api/sensor/calibrate、/api/robot，一共 12 个，10 个槽装不下，
     // 后面注册的会直接打 "no slots left for registering handler" 失败。
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 36;
     // 增加超时设置以更好地处理频繁请求
     config.recv_wait_timeout = 5;  // 接收超时5秒
     config.send_wait_timeout = 5;  // 发送超时5秒
@@ -224,6 +241,78 @@ bool WebServer::Start(int port) {
         .user_ctx  = this
     };
     httpd_register_uri_handler(server_handle_, &api_system_action_uri);
+
+    httpd_uri_t api_led_uri = {
+        .uri       = "/api/led",
+        .method    = HTTP_GET,
+        .handler   = api_led_status_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_led_uri);
+    httpd_uri_t led_page_uri = {
+        .uri       = "/led",
+        .method    = HTTP_GET,
+        .handler   = led_get_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &led_page_uri);
+
+
+    httpd_uri_t api_led_effects_uri = {
+        .uri       = "/api/led/effects",
+        .method    = HTTP_GET,
+        .handler   = api_led_effects_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_led_effects_uri);
+
+    httpd_uri_t api_led_apply_uri = {
+        .uri       = "/api/led/apply",
+        .method    = HTTP_POST,
+        .handler   = api_led_apply_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_led_apply_uri);
+
+    httpd_uri_t api_led_gcode_uri = {
+        .uri       = "/api/led/gcode",
+        .method    = HTTP_POST,
+        .handler   = api_led_gcode_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_led_gcode_uri);
+
+    httpd_uri_t api_led_slot_uri = {
+        .uri       = "/api/led/slot",
+        .method    = HTTP_POST,
+        .handler   = api_led_slot_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_led_slot_uri);
+
+    httpd_uri_t api_led_brightness_uri = {
+        .uri       = "/api/led/brightness",
+        .method    = HTTP_POST,
+        .handler   = api_led_brightness_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_led_brightness_uri);
+
+    httpd_uri_t api_led_count_uri = {
+        .uri       = "/api/led/count",
+        .method    = HTTP_POST,
+        .handler   = api_led_count_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_led_count_uri);
+
+    httpd_uri_t api_led_follow_uri = {
+        .uri       = "/api/led/follow",
+        .method    = HTTP_POST,
+        .handler   = api_led_follow_handler,
+        .user_ctx  = this
+    };
+    httpd_register_uri_handler(server_handle_, &api_led_follow_uri);
 
     ESP_LOGI(TAG, "Web server started successfully");
     return true;
@@ -990,6 +1079,7 @@ const char* WebServer::get_html_page() {
             <a href="/robot" class="control-btn" style="background:linear-gradient(135deg,#43a047,#2e7d32);text-decoration:none;">🤖 机器人</a>
             <a href="/sensor" class="control-btn" style="background:linear-gradient(135deg,#1e88e5,#1565c0);text-decoration:none;">📏 测距</a>
             <a href="/system" class="control-btn" style="background:linear-gradient(135deg,#8e24aa,#6a1b9a);text-decoration:none;">🔘 系统</a>
+            <a href="/led" class="control-btn" style="background:linear-gradient(135deg,#f9a825,#f57f17);text-decoration:none;">💡 灯光</a>
             <a href="/config" class="control-btn" style="background:linear-gradient(135deg,#FF9800,#F57C00);text-decoration:none;">⚙️ 电机</a>
         </div>
 
@@ -1765,6 +1855,432 @@ void WebServer::parse_config_form_data(const char* data, MotorActionConfig& conf
 }
 
 // 获取配置页面HTML
+const char* WebServer::get_led_html_page() {
+    static const char led_html_page[] = R"html(
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>彩灯</title>
+<style>
+    * { box-sizing: border-box; }
+    body {
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        background: #14161c;
+        color: #e8eaf0;
+        margin: 0;
+        padding: 16px;
+        padding-bottom: 40px;
+    }
+    .wrap { max-width: 560px; margin: 0 auto; }
+    h1 { font-size: 1.4em; margin: 0 0 4px; }
+    .sub { color: #8b93a7; font-size: .85em; margin-bottom: 16px; word-break: break-all; }
+    .card {
+        background: #1c1f28;
+        border: 1px solid #2a2f3c;
+        border-radius: 14px;
+        padding: 14px;
+        margin-bottom: 14px;
+    }
+    .card h2 {
+        font-size: .95em; margin: 0 0 12px; color: #aab3c6;
+        font-weight: 600; letter-spacing: .04em;
+    }
+    select, input[type=number], input[type=text] {
+        background: #12141a;
+        color: #e8eaf0;
+        border: 1px solid #333a4a;
+        border-radius: 8px;
+        padding: 8px 10px;
+        font-size: .95em;
+        width: 100%;
+    }
+    select:focus, input:focus { outline: 1px solid #4f8cff; }
+    .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+    .row > label { flex: 0 0 84px; color: #9aa3b7; font-size: .88em; }
+    .row > .grow { flex: 1; }
+    input[type=range] { width: 100%; accent-color: #4f8cff; }
+    .val { flex: 0 0 42px; text-align: right; font-variant-numeric: tabular-nums; color: #cfd6e6; font-size: .85em; }
+    .slider-row { margin-bottom: 12px; }
+    .slider-row .hint { color: #7c8599; font-size: .78em; margin-top: 2px; padding-left: 2px; }
+    .colors { display: flex; flex-wrap: wrap; gap: 10px; }
+    .swatch { display: flex; align-items: center; gap: 6px; }
+    .swatch input[type=color] {
+        width: 40px; height: 34px; padding: 0; border: 1px solid #333a4a;
+        border-radius: 8px; background: #12141a;
+    }
+    .btn {
+        border: none; border-radius: 10px; padding: 11px 16px;
+        font-size: .95em; font-weight: 600; cursor: pointer; flex: 1;
+    }
+    .btn.primary { background: linear-gradient(135deg,#4f8cff,#3568e0); color: #fff; }
+    .btn.ghost { background: #232838; color: #cfd6e6; border: 1px solid #333a4a; }
+    .btn:active { transform: translateY(1px); }
+    .btns { display: flex; gap: 10px; margin-top: 6px; }
+    .slots { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+    .slot-btn {
+        background: #232838; color: #cfd6e6; border: 1px solid #333a4a;
+        border-radius: 10px; padding: 10px; font-size: .85em; cursor: pointer; text-align: left;
+    }
+    .slot-btn b { display: block; color: #e8eaf0; margin-bottom: 2px; font-size: .95em; }
+    .slot-btn span { color: #7c8599; font-size: .75em; word-break: break-all; }
+    #toast {
+        position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(20px);
+        background: #262c3c; color: #e8eaf0; padding: 10px 18px; border-radius: 10px;
+        border: 1px solid #38405a; opacity: 0; transition: all .2s; pointer-events: none; font-size: .88em;
+    }
+    #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+<div class="wrap">
+    <h1>💡 彩灯</h1>
+    <div class="sub" id="gcode-line">正在读取…</div>
+
+    <div class="card">
+        <h2>效果</h2>
+        <select id="effect"></select>
+        <div id="sliders" style="margin-top:14px"></div>
+        <div style="margin-top:6px">
+            <div class="hint" id="color-hint" style="color:#7c8599;font-size:.78em;margin-bottom:8px"></div>
+            <div class="colors" id="colors"></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>亮度</h2>
+        <div class="row">
+            <label>整体亮度</label>
+            <div class="grow"><input type="range" id="brightness" min="1" max="100" value="100"></div>
+            <div class="val" id="brightness-val">100</div>
+        </div>
+        <div class="row">
+            <label>灯珠数量</label>
+            <div class="grow"><input type="number" id="ledcount" min="1" max="64" value="7"></div>
+            <button class="btn ghost" onclick="applyCount()">应用</button>
+        </div>
+        <div style="opacity:.6;font-size:12px;margin-top:6px">
+            改数量会重建灯带并重存到设备里，不用重新烧固件。上限 64 颗，受供电电流限制；超出数量的灯珠会被显式写黑。
+        </div>
+        <div class="btns" style="margin-top:10px">
+            <button class="btn ghost" onclick="followState()">恢复随状态联动</button>
+        </div>
+        <div style="opacity:.6;font-size:12px;margin-top:6px">
+            手动改过效果后，说话时灯不会再被切成语音律动。想恢复就点上面这个。
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>应用与保存</h2>
+        <div class="btns">
+            <button class="btn primary" onclick="applyNow()">立即应用</button>
+            <button class="btn ghost" onclick="saveSlot()">保存到槽位</button>
+        </div>
+        <div class="slots" id="slots"></div>
+        <div style="margin-top:12px">
+            <select id="slot-pick"></select>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>gcode</h2>
+        <div class="row">
+            <input type="text" id="gcode" placeholder="7,50,R">
+        </div>
+        <div class="btns">
+            <button class="btn ghost" onclick="applyGcode()">按 gcode 应用</button>
+            <button class="btn ghost" onclick="loadStatus()">刷新</button>
+        </div>
+    </div>
+
+    <div class="btns">
+        <a href="/" class="btn ghost" style="text-decoration:none;text-align:center">← 返回遥控</a>
+    </div>
+</div>
+<div id="toast"></div>
+
+<script>
+let effects = [];
+let cur = null;
+let pending = null;
+let applyTimer = null;
+
+function toast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(el._t);
+    el._t = setTimeout(() => el.classList.remove('show'), 1600);
+}
+
+function rgbToHex(c) {
+    return '#' + [c[0], c[1], c[2]].map(v => v.toString(16).padStart(2, '0')).join('');
+}
+function hexToRgb(hex) {
+    return [parseInt(hex.substr(1, 2), 16), parseInt(hex.substr(3, 2), 16), parseInt(hex.substr(5, 2), 16)];
+}
+
+const SLIDER_DEFS = [
+    { key: 'speed',     label: '速度',   bit: 1 },
+    { key: 'intensity', label: '强度',   bit: 2 },
+    { key: 'c1',        label: '参数一', bit: 4 },
+    { key: 'c2',        label: '参数二', bit: 8 },
+];
+
+function buildSliders(mask) {
+    const box = document.getElementById('sliders');
+    box.innerHTML = '';
+    const def = effects.find(e => e.id === cur.params.effect) || { p1: '', p2: '', p3: '', p4: '' };
+    const hints = [def.p1, def.p2, def.p3, def.p4];
+    SLIDER_DEFS.forEach((d, i) => {
+        if (!(mask & d.bit)) return;
+        const row = document.createElement('div');
+        row.className = 'slider-row';
+        row.innerHTML = `
+            <div class="row" style="margin-bottom:0">
+                <label style="flex:0 0 84px">${d.label}</label>
+                <div class="grow"><input type="range" min="0" max="255" value="${cur.params[d.key]}"></div>
+                <div class="val">${cur.params[d.key]}</div>
+            </div>
+            ${hints[i] ? `<div class="hint">${hints[i]}</div>` : ''}
+        `;
+        const input = row.querySelector('input');
+        const val = row.querySelector('.val');
+        input.addEventListener('input', () => {
+            cur.params[d.key] = parseInt(input.value, 10);
+            val.textContent = input.value;
+            scheduleApply();
+        });
+        box.appendChild(row);
+    });
+}
+
+function buildColors(cmin, cmax) {
+    const box = document.getElementById('colors');
+    const hint = document.getElementById('color-hint');
+    box.innerHTML = '';
+    let n = cur.params.colors.length;
+    if (n < cmin) {
+        while (cur.params.colors.length < cmin) cur.params.colors.push([255, 0, 0]);
+        n = cur.params.colors.length;
+    }
+    if (n > cmax) {
+        cur.params.colors.length = cmax;
+        n = cmax;
+    }
+    hint.textContent = cmax === 1 ? '颜色' : `颜色（${cmin}–${cmax} 组）`;
+    for (let i = 0; i < n; i++) {
+        const sw = document.createElement('div');
+        sw.className = 'swatch';
+        const picker = document.createElement('input');
+        picker.type = 'color';
+        picker.value = rgbToHex(cur.params.colors[i]);
+        picker.addEventListener('input', () => {
+            cur.params.colors[i] = hexToRgb(picker.value);
+            scheduleApply();
+        });
+        sw.appendChild(picker);
+        box.appendChild(sw);
+    }
+}
+
+function render() {
+    const def = effects.find(e => e.id === cur.params.effect);
+    if (!def) return;
+    document.getElementById('effect').value = String(def.id);
+    buildSliders(def.mask);
+    buildColors(def.cmin, def.cmax);
+    document.getElementById('gcode-line').textContent =
+        (cur.gcode || '') + '　·　' + def.name;
+}
+
+function scheduleApply() {
+    document.getElementById('gcode-line').textContent = '正在应用…';
+    clearTimeout(applyTimer);
+    applyTimer = setTimeout(applyNow, 120);
+}
+
+async function applyNow() {
+    try {
+        const r = await fetch('/api/led/apply', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(cur.params)
+        });
+        const j = await r.json();
+        if (!j.ok) { toast('应用失败：' + (j.message || '')); return; }
+        const s = await (await fetch('/api/led')).json();
+        cur.gcode = s.gcode;
+        document.getElementById('gcode-line').textContent =
+            s.gcode + '　·　' + (effects.find(e => e.id === cur.params.effect) || {}).name;
+    } catch (e) {
+        toast('网络错误');
+    }
+}
+
+async function saveSlot() {
+    const slot = document.getElementById('slot-pick').value;
+    try {
+        const r = await fetch('/api/led/slot', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ slot: slot, params: cur.params })
+        });
+        const j = await r.json();
+        toast(j.ok ? '已保存' : ('保存失败：' + (j.message || '')));
+        if (j.ok) loadStatus();
+    } catch (e) {
+        toast('网络错误');
+    }
+}
+
+async function applyGcode() {
+    const g = document.getElementById('gcode').value.trim();
+    if (!g) return;
+    try {
+        const r = await fetch('/api/led/gcode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ gcode: g })
+        });
+        const j = await r.json();
+        if (!j.ok) { toast('gcode 无效：' + (j.message || '')); return; }
+        toast('已应用');
+        loadStatus();
+    } catch (e) {
+        toast('网络错误');
+    }
+}
+
+async function loadStatus() {
+    const [fx, st] = await Promise.all([
+        fetch('/api/led/effects').then(r => r.json()),
+        fetch('/api/led').then(r => r.json())
+    ]);
+    effects = fx.effects || [];
+    cur = { params: st.params, gcode: st.gcode };
+
+    const sel = document.getElementById('effect');
+    sel.innerHTML = '';
+    effects.forEach(e => {
+        const o = document.createElement('option');
+        o.value = String(e.id);
+        o.textContent = e.name + (e.letter ? `（${e.letter}）` : '');
+        sel.appendChild(o);
+    });
+
+    const slotSel = document.getElementById('slot-pick');
+    const slotBox = document.getElementById('slots');
+    slotSel.innerHTML = '';
+    slotBox.innerHTML = '';
+    const SLOT_LABEL = {
+        startup_initial: '开机（先亮）',
+        startup_idle: '待机',
+        lightshow: '彩灯秀',
+        listening: '聆听',
+        speaking: '说话'
+    };
+    (st.slots || []).forEach(s => {
+        const o = document.createElement('option');
+        o.value = s.key;
+        o.textContent = (SLOT_LABEL[s.key] || s.key);
+        slotSel.appendChild(o);
+
+        const b = document.createElement('button');
+        b.className = 'slot-btn';
+        b.innerHTML = `<b>${SLOT_LABEL[s.key] || s.key}</b><span>${s.gcode || '（空）'}</span>`;
+        b.onclick = () => {
+            document.getElementById('gcode').value = s.gcode;
+        };
+        slotBox.appendChild(b);
+    });
+
+    const br = document.getElementById('brightness');
+    br.value = st.brightness;
+    document.getElementById('brightness-val').textContent = st.brightness;
+
+    if (st.led_count) {
+        const lc = document.getElementById('ledcount');
+        lc.value = st.led_count;
+        if (st.led_max) lc.max = st.led_max;
+    }
+
+    document.getElementById('gcode').value = st.gcode;
+    render();
+}
+
+document.getElementById('effect').addEventListener('change', e => {
+    cur.params.effect = parseInt(e.target.value, 10);
+    render();
+    scheduleApply();
+});
+
+let brTimer = null;
+document.getElementById('brightness').addEventListener('input', e => {
+    const v = parseInt(e.target.value, 10);
+    document.getElementById('brightness-val').textContent = v;
+    clearTimeout(brTimer);
+    brTimer = setTimeout(async () => {
+        try {
+            await fetch('/api/led/brightness', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ percent: v })
+            });
+        } catch (_) {}
+    }, 400);
+});
+
+async function followState() {
+    try {
+        await fetch('/api/led/follow', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ state: -1 })
+        });
+        toast('已恢复随状态联动');
+    } catch (_) { toast('操作失败'); }
+}
+
+async function applyCount() {
+    const el = document.getElementById('ledcount');
+    const n = parseInt(el.value, 10);
+    if (!(n >= 1)) { toast('数量至少 1'); return; }
+    try {
+        const r = await fetch('/api/led/count', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ count: n })
+        });
+        const j = await r.json();
+        if (j.ok) {
+            el.value = j.count;
+            toast('已改为 ' + j.count + ' 颗');
+        } else {
+            toast('改数量失败');
+        }
+    } catch (_) { toast('改数量失败'); }
+}
+
+loadStatus().catch(() => toast('读取失败'));
+</script>
+</body>
+</html>
+
+
+)html";
+    return led_html_page;
+}
+
+esp_err_t WebServer::led_get_handler(httpd_req_t *req) {
+    WebServer* server = (WebServer*)req->user_ctx;
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, server->get_led_html_page(), HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
 const char* WebServer::get_config_html_page() {
     static const char config_html_page[] = R"html(
 <!DOCTYPE html>
@@ -2417,8 +2933,209 @@ refresh();
 // state 直接塞进 action 的 GET。为省槽位，state 走 /api/robot 的响应扩展，
 // 页面改成读它。见下面 api_system_action_handler 的注释。
 
-esp_err_t WebServer::api_system_action_handler(httpd_req_t *req) {
-    WebServer* server = (WebServer*)req->user_ctx;
+// ---------- 灯光 ----------
+// 板卡侧函数返回的是完整 JSON 文本；这里只负责发出去。
+// 缓冲区用 static：httpd 是单任务串行处理，同一时刻只有一个 handler 在跑。
+
+esp_err_t WebServer::api_led_status_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req, "application/json");
+    static char buf[2048];
+    if (HandleLedStatusJson == nullptr || !HandleLedStatusJson(buf, sizeof(buf))) {
+        httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"led unavailable\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+esp_err_t WebServer::api_led_effects_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req, "application/json");
+    static char buf[4096];
+    if (HandleLedEffectsJson == nullptr || !HandleLedEffectsJson(buf, sizeof(buf))) {
+        httpd_resp_send(req, "{\"status\":\"error\",\"message\":\"led unavailable\"}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+namespace {
+
+// 读 POST body 并按 C 接口约定回一句结果。
+// 板卡侧给的是 send_status 风格：ok -> 200 + {"ok":true}
+char g_led_err[128];
+
+esp_err_t SendLedResult(httpd_req_t *req, bool ok) {
+    httpd_resp_set_type(req, "application/json");
+    if (ok) {
+        httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    char out[256];
+    snprintf(out, sizeof(out), "{\"ok\":false,\"message\":\"%s\"}",
+             g_led_err[0] ? g_led_err : "failed");
+    httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+int ReadBody(httpd_req_t *req, char* buf, size_t len) {
+    if (len < 2) return -1;
+    int ret = httpd_req_recv(req, buf, len - 1);
+    if (ret < 0) return -1;
+    buf[ret] = 0;
+    return ret;
+}
+
+}  // namespace
+
+esp_err_t WebServer::api_led_apply_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (HandleLedApplyJson == nullptr) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "led unavailable");
+        return ESP_FAIL;
+    }
+    char body[768];
+    if (ReadBody(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No content");
+        return ESP_FAIL;
+    }
+    g_led_err[0] = 0;
+    return SendLedResult(req, HandleLedApplyJson(body, g_led_err, sizeof(g_led_err)));
+}
+
+esp_err_t WebServer::api_led_gcode_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (HandleLedApplyGcode == nullptr) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "led unavailable");
+        return ESP_FAIL;
+    }
+    char body[192];
+    if (ReadBody(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No content");
+        return ESP_FAIL;
+    }
+    // 允许纯文本 gcode，也允许 {"gcode":"..."}
+    char gcode[128];
+    if (body[0] == '{') {
+        cJSON* root = cJSON_Parse(body);
+        cJSON* item = root ? cJSON_GetObjectItemCaseSensitive(root, "gcode") : nullptr;
+        if (!cJSON_IsString(item)) {
+            if (root) cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "gcode expected");
+            return ESP_FAIL;
+        }
+        snprintf(gcode, sizeof(gcode), "%s", item->valuestring);
+        cJSON_Delete(root);
+    } else {
+        size_t n = strnlen(body, sizeof(body));
+        if (n >= sizeof(gcode)) {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "gcode too long");
+            return ESP_FAIL;
+        }
+        memcpy(gcode, body, n + 1);
+    }
+    g_led_err[0] = 0;
+    return SendLedResult(req, HandleLedApplyGcode(gcode, g_led_err, sizeof(g_led_err)));
+}
+
+esp_err_t WebServer::api_led_slot_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (HandleLedSaveSlotJson == nullptr) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "led unavailable");
+        return ESP_FAIL;
+    }
+    char body[768];
+    if (ReadBody(req, body, sizeof(body)) < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No content");
+        return ESP_FAIL;
+    }
+    g_led_err[0] = 0;
+    return SendLedResult(req, HandleLedSaveSlotJson(body, g_led_err, sizeof(g_led_err)));
+}
+
+esp_err_t WebServer::api_led_brightness_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req, "application/json");
+    if (HandleLedSetBrightness == nullptr) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "led unavailable");
+        return ESP_FAIL;
+    }
+    char body[96];
+    int percent = -1;
+    if (ReadBody(req, body, sizeof(body)) >= 0) {
+        cJSON* root = cJSON_Parse(body);
+        cJSON* item = root ? cJSON_GetObjectItemCaseSensitive(root, "percent") : nullptr;
+        if (cJSON_IsNumber(item)) percent = item->valueint;
+        if (root) cJSON_Delete(root);
+    }
+    if (percent < 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "percent expected");
+        return ESP_FAIL;
+    }
+    int now = HandleLedSetBrightness(percent);
+    char out[64];
+    snprintf(out, sizeof(out), "{\"ok\":true,\"brightness\":%d}", now);
+    httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// 改灯珠数量。要重建 RMT 句柄，耗时几十毫秒，前端按普通 POST 处理就行。
+esp_err_t WebServer::api_led_count_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req, "application/json");
+    if (HandleLedSetCount == nullptr) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "led unavailable");
+        return ESP_FAIL;
+    }
+    char body[96];
+    int count = -1;
+    if (ReadBody(req, body, sizeof(body)) >= 0) {
+        cJSON* root = cJSON_Parse(body);
+        cJSON* item = root ? cJSON_GetObjectItemCaseSensitive(root, "count") : nullptr;
+        if (cJSON_IsNumber(item)) count = item->valueint;
+        if (root) cJSON_Delete(root);
+    }
+    if (count < 1) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "count expected");
+        return ESP_FAIL;
+    }
+    int now = HandleLedSetCount(count);
+    char out[64];
+    if (now < 0) {
+        snprintf(out, sizeof(out), "{\"ok\":false}");
+        httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    snprintf(out, sizeof(out), "{\"ok\":true,\"count\":%d}", now);
+    httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// 恢复「跟随设备状态」：清掉手动覆盖，让说话/聆听重新能切槽位。
+// 前端把当前 device state 一起带上来，省得设备再查一遍。
+esp_err_t WebServer::api_led_follow_handler(httpd_req_t *req) {
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_type(req, "application/json");
+    if (HandleLedFollowState == nullptr) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "led unavailable");
+        return ESP_FAIL;
+    }
+    char body[64];
+    int state = -1;
+    if (ReadBody(req, body, sizeof(body)) >= 0) {
+        cJSON* root = cJSON_Parse(body);
+        cJSON* item = root ? cJSON_GetObjectItemCaseSensitive(root, "state") : nullptr;
+        if (cJSON_IsNumber(item)) state = item->valueint;
+        if (root) cJSON_Delete(root);
+    }
+    HandleLedFollowState(state);
+    httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+esp_err_t WebServer::api_system_action_handler(httpd_req_t *req) {    WebServer* server = (WebServer*)req->user_ctx;
     char buf[256];
     int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
     if (ret <= 0) {

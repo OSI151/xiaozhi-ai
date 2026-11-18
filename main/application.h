@@ -12,6 +12,7 @@
 #include <memory>
 #include <atomic>
 #include <queue>
+#include <functional>
 
 #include "protocol.h"
 #include "ota.h"
@@ -153,7 +154,9 @@ public:
     // 第 10 步：机器人模式
     // 返回值是错误说明，空串表示启动成功。这样工具层能直接把原因念给用户听。
     std::string StartRobotMode(int mode);
-    void StopRobotMode();
+    // return_to_default=false 用于超时自动退出：那条路径紧接着就要进大时钟，
+    // 先切一次官方界面会白闪一帧。
+    void StopRobotMode(bool return_to_default = true);
     int GetRobotMode() const { return robot_mode_.load(); }
     static const char* RobotModeName(int mode);
 
@@ -174,6 +177,20 @@ public:
     SensorSnapshot GetSensorSnapshot() const;
     bool CalibrateSensor(int* baseline_mm_out);
 
+    // 开关量避障探针（红外对管一类，只回答"前方有没有东西"）。
+    // 不用裸指针是因为 application.h 不该 include 板卡目录的头文件——
+    // 板卡把自己的传感器包成 lambda 传进来，Application 只管问。
+    // 接上之后电机闸门多一道拦截，另外起一个 50ms 看门任务处理
+    // "已经开出去了、障碍物才出现"这种情况（实时控制是一次性下发，
+    // 不会自己重复经过闸门）。
+    void AttachObstacleProbe(std::function<bool()> probe);
+
+    // 设备状态变化时转给板卡，让板卡自己决定灯带切哪个槽位。
+    // 放在这里是因为板卡层才拿得到 RgbStrip，Application 只认得抽象的 Led。
+    void SetLedStateListener(std::function<void(int)> listener) {
+        led_state_listener_ = std::move(listener);
+    }
+
     void ToggleDisplayMode();
 
     // 给串口终端用的手动驱动入口。SetRealtimeMotorCommand 本身是 private，
@@ -186,8 +203,14 @@ public:
     // Sleep  = 整屏大字时钟，60 秒没交互自动进
     // Eyes   = RoboEyes 眼睛 + 底部字幕（第 7 步把字幕开出来）
     static constexpr int kIdleToSleepSeconds = 60;
+    // 机器人模式下的最高时限：没人理它这么久，就退出模式并直接进大时钟。
+    // 机器人模式自己不会进时钟（CanEnterSleepMode 拦着），所以这是唯一出口。
+    static constexpr int kRobotIdleTimeoutSeconds = 20 * 60;
     void EnterSleep();          // 主动进睡眠：切时钟 + 降频
-    void WakeUp();              // 从睡眠唤醒：切眼睛 + 恢复性能
+    void WakeUp();              // 从睡眠唤醒：机器人模式在跑就切眼睛，否则回官方界面
+    // 记一次「人跟它互动了」的时间戳。只有唤醒词、听说状态、Web 遥控算，
+    // 机器人自己驱动电机的调用不算，否则它一直在走就永远不会超时。
+    void TouchRobotInteraction();
     void ResetIdleTimer();      // 有交互就重置 60 秒倒计时
     bool IsBusyWithTask();      // 正在听/说/连/升级——这些状态下不许睡
 
@@ -260,8 +283,13 @@ private:
     ListeningMode listening_mode_ = kListeningModeAutoStop;
 
     // TTS 兜底：服务端偶尔不发 tts stop，设备会永远停在 speaking。
-    // 记「播放队列开始空」的时刻，空满 3 秒就强制回聆听。
+    // 判据不能用「队列空多久」——服务端换句、跑工具时队列本来就是空的，
+    // 2026-11-18 实测按 3 秒判会把正常播放打断（切走以后 OnIncomingAudio
+    // 的状态门禁又把后续音频全丢掉，听起来就是话说一半没了）。
+    // 现在：队列空 6 秒只记一条日志；距最后一个 TTS 音频帧满 15 秒才判卡死。
+    std::atomic<int64_t> last_tts_audio_ms_{0};
     int64_t tts_idle_since_ms_ = 0;
+    bool tts_idle_logged_ = false;
 
     // 只有收到 % play_music 之后，下一条《歌名》才算歌名。
     // 否则服务端回答"有这几首：《A》《B》"时也会被误判成进音乐界面。
@@ -291,10 +319,23 @@ private:
     DisplayMode display_mode_ = kDisplayModeDefault;
     // 进音乐之前停在哪一屏。退出音乐时原样恢复，不擅自改用户的界面选择。
     DisplayMode display_mode_before_music_ = kDisplayModeDefault;
+    // 进大时钟之前停在哪一屏。唤醒时就回这一屏：
+    //   睡觉前是眼睛（机器人模式）→ 醒来还是眼睛
+    //   睡觉前是官方界面           → 醒来还是官方界面
+    // 只记 Default / EyeOnly 两种，别的（音乐）一律当 Default。
+    DisplayMode display_mode_before_sleep_ = kDisplayModeDefault;
     // 静音前的音量。-1 表示当前没静音。不能拿 0 当静音标记：
     // audio_codec.cc 看到音量 <= 0 会警告并强制改成 10。
     int volume_before_mute_ = -1;
     Vl6180xSensor* sensor_ = nullptr;
+
+    // 开关量避障（红外对管）。空 std::function 表示这块板子没装这类传感器。
+    std::function<bool()> obstacle_probe_;
+    // 状态变化回调（参数是 DeviceState 的整数值）。空表示板卡不关心。
+    std::function<void(int)> led_state_listener_;
+    bool obstacle_watch_started_ = false;
+    void CheckObstacleWatchdog();
+
     // 上一句推断出来的语气。相同就不重复 SetEmotion——
     // SetEmotion 内部会先关掉 idle/curiosity/flicker 再重设，
     // 每句都调一次会把正在跑的小动画打断，看起来反而更僵。
@@ -311,6 +352,8 @@ private:
     // 最近一次电机指令是不是 Web 遥控器发的。
     // 传感器触发保护性停车时要看这个：Web 是手动模式，不被自动停。
     std::atomic<bool> last_command_from_web_{false};
+    // 连续被拒次数。成功下发一条就清零，机器人模式据此判断是不是卡死了。
+    std::atomic<int> motor_refusal_streak_{0};
     std::atomic<int> current_motor_priority_{0};
     std::atomic<int64_t> last_realtime_command_ms_{0};
 
@@ -324,7 +367,12 @@ private:
 
     // from_web=true 时跳过传感器安全闸门。
     // Web 遥控器是手动模式，要能强行开，否则传感器一坏连遥控也废了。
-    void SetRealtimeMotorCommand(int direction, int speed, bool from_web = false);
+    // 返回 false 表示这一条被闸门拒了（传感器不可用超时 / 前方障碍 / 后方红外）。
+    // 机器人模式靠它区分「已经在走」和「根本走不动」，是双向锁死脱困的判据。
+    bool SetRealtimeMotorCommand(int direction, int speed, bool from_web = false);
+
+    // 前后同时被拦时的脱困：原地转向换一个朝向再试。
+    bool EscapeFromDeadlock();
 
     // 传感器不可用时，前进/后退已经从哪一刻开始算。0 表示没在走。
     // 降级策略是"前后最多 1 秒"，实时控制没有 duration，只能自己计时。
@@ -351,6 +399,10 @@ private:
     std::atomic<bool> robot_paused_{false};
     // 暂停期间机器人可能被挪动，恢复时要先原地校准一次。
     std::atomic<bool> robot_need_recalibrate_{false};
+
+    // 最后一次「人跟它互动」的时刻（esp_timer_get_time()/1000）。
+    // 0 表示还没记录过，StartRobotMode 里会设成当前时间。
+    std::atomic<int64_t> last_robot_interaction_ms_{0};
 
     // explore 上一个方向码，用来禁止连续走反方向。
     // 纯随机时「前→后→前」这种组合出现得不算少，看着像原地晃。
