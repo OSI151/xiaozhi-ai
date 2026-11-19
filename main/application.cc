@@ -28,7 +28,7 @@
 
 // 板卡引脚。CMakeLists 的 INCLUDE_DIRS 不含 boards/<BOARD_TYPE>，所以 application.cc
 // 拿不到板卡 config.h，只能在这里兜底。这几个值必须和
-// boards/xiaozhi-ai/config.h 里的 MOTOR_*_GPIO 保持一致。
+// boards/deepseeking-robot/config.h 里的 MOTOR_*_GPIO 保持一致。
 #ifndef MOTOR_LF_GPIO
 #define MOTOR_LF_GPIO GPIO_NUM_12   // 左前，接 DRV8833 AIN1
 #define MOTOR_LB_GPIO GPIO_NUM_13   // 左后，接 DRV8833 AIN2
@@ -2780,7 +2780,7 @@ extern "C" const char* RobotModeNameOf(int mode) {
 // 用 extern "C" 暴露出去。
 
 // 模拟 BOOT 键。短按 = 开/关对话；长按 = 眼睛 ↔ 官方界面互切。
-// 跟 boards/xiaozhi-ai/xiaozhi_ai.cc 里实体键的行为保持一致。
+// 跟 boards/deepseeking-robot/deepseeking_robot.cc 里实体键的行为保持一致。
 extern "C" void HandleSystemBoot(int long_press) {
     auto& app = Application::GetInstance();
     if (app.GetDeviceState() == kDeviceStateStarting) {

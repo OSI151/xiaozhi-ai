@@ -29,7 +29,7 @@ extern "C" {
     const char* HandleDisplayModeQuery();
 }
 
-// 灯光接口由板卡实现（main/boards/xiaozhi-ai/xiaozhi_ai.cc）。
+// 灯光接口由板卡实现（main/boards/deepseeking-robot/deepseeking_robot.cc）。
 // 用 weak 是为了别的板卡编这个文件时不会链接失败——那种情况下这几个符号是空的，
 // handler 会直接回 503。
 extern "C" {
@@ -1976,6 +1976,7 @@ const char* WebServer::get_led_html_page() {
         <div class="btns">
             <button class="btn primary" onclick="applyNow()">立即应用</button>
             <button class="btn ghost" onclick="saveSlot()">保存到槽位</button>
+            <button class="btn ghost" onclick="ledOff()">关灯</button>
         </div>
         <div class="slots" id="slots"></div>
         <div style="margin-top:12px">
@@ -2130,6 +2131,22 @@ async function saveSlot() {
         const j = await r.json();
         toast(j.ok ? '已保存' : ('保存失败：' + (j.message || '')));
         if (j.ok) loadStatus();
+    } catch (e) {
+        toast('网络错误');
+    }
+}
+
+async function ledOff() {
+    try {
+        const r = await fetch('/api/led/gcode', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ gcode: '0' })
+        });
+        const j = await r.json();
+        if (!j.ok) { toast('关灯失败：' + (j.message || '')); return; }
+        toast('已关灯');
+        loadStatus();
     } catch (e) {
         toast('网络错误');
     }

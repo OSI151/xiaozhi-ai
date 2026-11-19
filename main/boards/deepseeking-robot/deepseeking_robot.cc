@@ -27,7 +27,7 @@
 #include <esp_lcd_panel_sh1106.h>
 #endif
 
-#define TAG "XiaozhiAiBoard"
+#define TAG "DeepSeekingRobot"
 
 // 给 web_server 用的句柄。web_server 不 include 板卡头文件，
 // 只通过下面这组 extern "C" 函数访问灯带。
@@ -38,7 +38,7 @@ static RgbStrip* g_rgb_strip_for_web = nullptr;
 // priority:  0=空闲微动作 1=情绪反馈 2=用户明确指令
 extern "C" void HandleMotorActionForApplication(int direction, int speed, int duration_ms, int priority);
 
-class XiaozhiAiBoard : public WifiBoard {
+class DeepSeekingRobot : public WifiBoard {
 private:
     i2c_master_bus_handle_t display_i2c_bus_;
     // 传感器独立走 I2C1（GPIO1=SCL / GPIO2=SDA），不跟屏幕抢总线。
@@ -59,6 +59,125 @@ private:
     std::unique_ptr<RgbStrip> rgb_strip_;
     std::unique_ptr<InfraredAvoidSensor> infrared_avoid_;
 
+    // ===== 启动自检 =====
+    // 这台机器从主控到传感器全是手焊的，传感器那四根线是裸铜直接焊在分线板孔上。
+    // 出问题时唯一的诊断手段本来是串口，但 CH343 的 DTR/RTS 接着 EN，一插线就复位，
+    // 开机那几秒抓不住。所以在屏幕上留一屏结果：不插线就知道哪块没起来。
+    // 只覆盖板卡自己初始化的外设（屏幕 / 传感器 / 后向红外 / 灯带）。
+    // 音频和电机在 Application 里初始化，出没出声、轮子转不转，人当场就能看出来。
+    struct CheckResult {
+        const char* name;
+        bool ok;
+        char detail[36];
+    };
+    static constexpr int kMaxChecks = 6;
+    CheckResult checks_[kMaxChecks];
+    int check_count_ = 0;
+
+    void AddCheck(const char* name, bool ok, const char* detail) {
+        if (check_count_ >= kMaxChecks) {
+            return;
+        }
+        CheckResult& c = checks_[check_count_++];
+        c.name = name;
+        c.ok = ok;
+        snprintf(c.detail, sizeof(c.detail), "%s", detail != nullptr ? detail : "");
+    }
+
+    void ShowSelfCheck() {
+        // Order matches initialization order.
+        int ok_count = 0;
+        for (int i = 0; i < check_count_; ++i) {
+            if (checks_[i].ok) {
+                ++ok_count;
+            }
+        }
+        const unsigned heap_kb = (unsigned)(esp_get_free_heap_size() / 1024);
+
+        ESP_LOGI(TAG, "self check: %d/%d ok, heap %uK", ok_count, check_count_, heap_kb);
+        for (int i = 0; i < check_count_; ++i) {
+            ESP_LOGI(TAG, "  %-6s %s %s", checks_[i].name, checks_[i].ok ? "OK  " : "FAIL",
+                     checks_[i].detail);
+        }
+
+        // Do not create a new screen: after deleting it lv_screen_active() may be NULL and
+        // SetupUI crashes. Draw on lv_layer_top() instead and only delete our own child.
+        lv_obj_t* panel = nullptr;
+        {
+            DisplayLockGuard lock(display_);
+            lv_obj_t* top = lv_layer_top();
+            if (top != nullptr) {
+                panel = lv_obj_create(top);
+            }
+            if (panel != nullptr) {
+                lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_set_size(panel, display_ != nullptr ? display_->width() : 128,
+                                display_ != nullptr ? display_->height() : 64);
+                lv_obj_set_pos(panel, 0, 0);
+                lv_obj_set_style_bg_color(panel, lv_color_black(), 0);
+                lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+                lv_obj_set_style_border_width(panel, 0, 0);
+                lv_obj_set_style_radius(panel, 0, 0);
+                lv_obj_set_style_pad_all(panel, 0, 0);
+
+                char buf[64];
+                snprintf(buf, sizeof(buf), "SELF %d/%d %s", ok_count, check_count_,
+                         ok_count == check_count_ ? "OK" : "FAIL");
+                lv_obj_t* l1 = lv_label_create(panel);
+                lv_label_set_text(l1, buf);
+                lv_obj_set_style_text_color(l1, lv_color_white(), 0);
+                lv_obj_set_pos(l1, 1, 0);
+
+                char row2[40];
+                char row3[40];
+                int n2 = 0;
+                int n3 = 0;
+                row2[0] = 0;
+                row3[0] = 0;
+                for (int i = 0; i < check_count_; ++i) {
+                    if (i < 2) {
+                        n2 += snprintf(row2 + n2, sizeof(row2) - n2, "%s%c ", checks_[i].name,
+                                       checks_[i].ok ? '+' : 'x');
+                    } else if (i < 4) {
+                        n3 += snprintf(row3 + n3, sizeof(row3) - n3, "%s%c ", checks_[i].name,
+                                       checks_[i].ok ? '+' : 'x');
+                    }
+                }
+                lv_obj_t* l2 = lv_label_create(panel);
+                lv_label_set_text(l2, row2);
+                lv_obj_set_style_text_color(l2, lv_color_white(), 0);
+                lv_obj_set_pos(l2, 1, 16);
+
+                // 有失败时第三行换成失败详情，比逐项状态更有用
+                char fail_detail[32];
+                fail_detail[0] = 0;
+                for (int i = 0; i < check_count_; ++i) {
+                    if (!checks_[i].ok) {
+                        snprintf(fail_detail, sizeof(fail_detail), "%s", checks_[i].detail);
+                        break;
+                    }
+                }
+                lv_obj_t* l3 = lv_label_create(panel);
+                lv_label_set_text(l3, fail_detail[0] != 0 ? fail_detail : row3);
+                lv_obj_set_style_text_color(l3, lv_color_white(), 0);
+                lv_obj_set_pos(l3, 1, 32);
+
+                snprintf(buf, sizeof(buf), "HEAP %uK", heap_kb);
+                lv_obj_t* l4 = lv_label_create(panel);
+                lv_label_set_text(l4, buf);
+                lv_obj_set_style_text_color(l4, lv_color_white(), 0);
+                lv_obj_set_pos(l4, 1, 48);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(ok_count == check_count_ ? 1500 : 4000));
+
+        if (panel != nullptr) {
+            DisplayLockGuard lock(display_);
+            lv_obj_del(panel);
+        }
+    }
+
     void InitializeRgbStrip() {
         // 灯珠数量可以从 Web 改并存 NVS，所以上电时以存下来的为准，
         // 没存过才用 config.h 里的编译期默认值。
@@ -73,6 +192,12 @@ private:
         // 开机不主动亮灯：之前调的是 kSlotStartupInitial（青色常亮），
         // 用户关灯后一重启又亮起来，像是没关掉。改走 idle 槽位（灭灯）。
         rgb_strip_->ApplySlot(RgbStrip::kSlotStartupIdle);
+        {
+            char strip_detail[36];
+            snprintf(strip_detail, sizeof(strip_detail), "%u/%u pcs",
+                     (unsigned)rgb_strip_->LedCount(), (unsigned)rgb_strip_->StripLength());
+            AddCheck("LED", true, strip_detail);
+        }
 
         // 状态 → 灯带槽位。listening/speaking 两个槽位早就定义了却一直没人用，
         // 因为板卡收不到状态变化（Board 基类只有 Led 才有 OnStateChanged）。
@@ -140,6 +265,7 @@ private:
     void InitializeSensor() {
         if (sensor_i2c_bus_ == nullptr) {
             ESP_LOGW(TAG, "sensor bus unavailable, skipping VL6180X");
+            AddCheck("TOF", false, "I2C1 bus fail");
             return;
         }
         sensor_ = std::make_unique<Vl6180xSensor>();
@@ -147,9 +273,11 @@ private:
             // 读不到不算致命：板子照常启动，测距类和依赖距离的机器人模式会报"没有传感器"。
             ESP_LOGW(TAG, "VL6180X not detected, distance features disabled");
             sensor_.reset();
+            AddCheck("TOF", false, "0x29 no ack");
             return;
         }
         sensor_->Start();
+        AddCheck("TOF", true, "ready");
         // 交给 Application，Web 和模式逻辑都从它那儿取快照。
         Application::GetInstance().AttachSensor(sensor_.get());
     }
@@ -163,6 +291,7 @@ private:
             ESP_LOGW(TAG, "infrared avoid init failed on GPIO%d, backward guard disabled",
                      static_cast<int>(INFRARED_AVOID_GPIO));
             infrared_avoid_.reset();
+            AddCheck("IR", false, "GPIO8 init fail");
             return;
         }
         // 包成 lambda 交给 Application：那边不 include 板卡头文件，
@@ -172,6 +301,7 @@ private:
         ESP_LOGI(TAG, "infrared avoid ready: GPIO%d, active %s",
                  static_cast<int>(INFRARED_AVOID_GPIO),
                  INFRARED_AVOID_ACTIVE_LOW ? "low" : "high");
+        AddCheck("IR", true, "GPIO8 ready");
     }
 
     // SSD1306 与 SH1106 共用这套 IO 配置，只有 panel 构造函数不同
@@ -227,6 +357,7 @@ private:
             panel_ = nullptr;
             panel_io_ = nullptr;
             display_ = new NoDisplay();
+            AddCheck("DISP", false, "panel no ack");
             return;
         }
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_, false));
@@ -237,6 +368,7 @@ private:
         display_ = new OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT,
                                    DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
         ESP_LOGI(TAG, "Display ready: %dx%d", DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        AddCheck("DISP", true, "SH1106 128x64");
     }
 
     void InitializeButtons() {
@@ -627,6 +759,67 @@ private:
                        std::to_string(RgbStrip::GetBrightness()) + "%";
             });
 
+        mcp_server.AddTool("self.rgb_led.set_effect",
+            "设置彩灯效果，并直接调整速度和强度。效果名用中文或字母都行。\n"
+            "Args:\n"
+            "  `effect`: 效果名或字母。中文：常亮/呼吸/脉冲/彩虹/彩虹流水/渐变/多色流水/跑马/闪烁/流星/闪电/波浪/雪花/赛车/语音律动；字母：W/U/R/P/G/C/S/F/T/L/V/N/K/B\n"
+            "  `speed`: 速度 0-255，越大越快，默认 128\n"
+            "  `intensity`: 强度 0-255。呼吸=最低亮度，脉冲=拖尾长度，彩虹=饱和度，雪花=密度，语音律动=扩散范围\n"
+            "  `colors`: 颜色，格式 \"255,0,0\" 或 \"255,0,0;0,0,255\"（分号分隔多组，最多 6 组）",
+            PropertyList({
+                Property("effect", kPropertyTypeString),
+                Property("speed", kPropertyTypeInteger, 128, 0, 255),
+                Property("intensity", kPropertyTypeInteger, 128, 0, 255),
+                Property("colors", kPropertyTypeString, "")
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string name = properties["effect"].value<std::string>();
+                int speed = properties["speed"].value<int>();
+                int intensity = properties["intensity"].value<int>();
+                std::string colors = properties["colors"].value<std::string>();
+
+                StripParams p;
+                p.speed = (uint8_t)speed;
+                p.intensity = (uint8_t)intensity;
+                p.color_count = 0;
+
+                // 先按中文名找，再按字母找
+                uint8_t fx = FindEffectByName(name.c_str());
+                if (fx >= kFxCount) {
+                    if (name.size() == 1) {
+                        fx = FindEffectByLetter(name[0]);
+                    }
+                }
+                if (fx >= kFxCount) {
+                    return std::string("没有这个效果：") + name;
+                }
+                p.effect = fx;
+
+                // 颜色串解析：逗号分三元组，分号分组
+                size_t start = 0;
+                while (start < colors.size() && p.color_count < 6) {
+                    size_t semi = colors.find(';', start);
+                    std::string one = colors.substr(start, semi == std::string::npos ? std::string::npos
+                                                                                  : semi - start);
+                    int r = 0, g = 0, b = 0;
+                    if (sscanf(one.c_str(), "%d,%d,%d", &r, &g, &b) == 3) {
+                        p.colors[p.color_count++] =
+                            StripColor{(uint8_t)r, (uint8_t)g, (uint8_t)b};
+                    }
+                    if (semi == std::string::npos) {
+                        break;
+                    }
+                    start = semi + 1;
+                }
+                if (p.color_count == 0) {
+                    p.colors[0] = StripColor{255, 255, 255};
+                    p.color_count = 1;
+                }
+
+                rgb_strip_->ApplyParams(p);
+                return std::string("已切换到 ") + kEffects[fx].name;
+            });
+
         mcp_server.AddTool("self.rgb_led.custom",
             "用格式指令自定义彩灯效果。\n"
             "语法：<LED数量>,<速度ms>,<特效>[,R,G,B]\n"
@@ -811,7 +1004,7 @@ private:
     }
 
 public:
-    XiaozhiAiBoard() :
+    DeepSeekingRobot() :
         boot_button_(BOOT_BUTTON_GPIO, false, 1000),   // 第 6 步：长按判定 1 秒
         touch_button_(TOUCH_BUTTON_GPIO),
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
@@ -824,6 +1017,7 @@ public:
         InitializeButtons();
         InitializeRgbStrip();
         InitializeTools();
+        ShowSelfCheck();
     }
 
     virtual Led* GetLed() override {
@@ -848,7 +1042,7 @@ public:
     }
 };
 
-DECLARE_BOARD(XiaozhiAiBoard);
+DECLARE_BOARD(DeepSeekingRobot);
 
 // ===== 灯光 Web 接口 =====
 // web_server.cc 是公共文件，不 include 板卡头文件；所以这里只导出 C 接口，

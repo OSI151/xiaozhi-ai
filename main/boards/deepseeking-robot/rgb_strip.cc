@@ -465,6 +465,21 @@ bool RgbStrip::ParseToParams(const std::string& gcode, StripParams* out, std::st
     }
     parts.push_back(Trim(cur));
 
+    // 只写一个数字 = 只给数量。写 0 就是关灯，这是最顺手的写法，
+    // 不用凑成 "0,0,0" 三段。
+    if (parts.size() == 1) {
+        long only = 0;
+        if (ParseInt(parts[0], 0, 100, &only) && only == 0) {
+            p.effect = kFxSolid;
+            p.speed = 128;
+            p.intensity = 128;
+            p.colors[0] = StripColor{0, 0, 0};
+            p.color_count = 1;
+            *out = p;
+            return true;
+        }
+    }
+
     if (parts.size() < 3) {
         if (error) *error = "格式应为 <数量>,<速度ms>,<效果>[,R,G,B...]";
         return false;
